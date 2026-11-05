@@ -1,0 +1,5 @@
+# Robots.txt - Mir Elektrik Proje
+User-agent: *
+Allow: /
+
+Sitemap: https://mirelektrikproje.com/sitemap.xml

@@ -1,0 +1,6 @@
+{
+  "name": "Mir Elektrik Proje - Bursa Elektrik Proje & Mühendislik",
+  "description": "Bursa merkezli Mir Elektrik Proje Ofisi kurumsal web platformu ve cPanel hazır statik HTML mimarisi.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
