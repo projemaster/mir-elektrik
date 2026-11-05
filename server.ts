@@ -3,7 +3,11 @@ import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import { GoogleGenAI } from '@google/genai';
+import { safeFetchHtml, requireAdminAuth } from './server/security.js';
+import { getProviderStatus, executeLlmCall } from './server/llmGateway.js';
+import { scrapeAndAnalyzeUrl, runDeepCompetitorResearch, extractCleanTextFromHtml } from './server/webResearch.js';
+import { getDbStatus, listArticlesFromDb, getArticleById } from './server/supabaseService.js';
+import { runRealAgentOrchestration } from './server/agentOrchestrator.js';
 
 dotenv.config();
 
@@ -18,25 +22,52 @@ async function startServer() {
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-  // Initialize Gemini API if key is available
-  let genAiClient: GoogleGenAI | null = null;
-  if (process.env.GEMINI_API_KEY) {
+  // =========================================================================
+  // API 1: PROVIDER HEALTH & STATUS
+  // =========================================================================
+  app.get('/api/ai/providers', (_req, res) => {
     try {
-      genAiClient = new GoogleGenAI({
-        apiKey: process.env.GEMINI_API_KEY,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build',
-          },
-        },
-      });
-      console.log('Gemini API client initialized successfully on server');
-    } catch (err) {
-      console.warn('Failed to initialize Gemini client:', err);
+      const providers = getProviderStatus();
+      return res.json({ success: true, providers });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
     }
-  }
+  });
 
-  // API 1: Fetch URL content for reference knowledge vault (URL git ve getir)
+  // =========================================================================
+  // API 2: DATABASE & SUPABASE STATUS
+  // =========================================================================
+  app.get('/api/database/status', (_req, res) => {
+    try {
+      const status = getDbStatus();
+      return res.json({ success: true, ...status });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/database/articles', async (_req, res) => {
+    try {
+      const articles = await listArticlesFromDb();
+      return res.json({ success: true, articles });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/database/articles/:id', async (req, res) => {
+    try {
+      const article = await getArticleById(req.params.id);
+      if (!article) return res.status(404).json({ error: 'Makale bulunamadı' });
+      return res.json({ success: true, article });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  // =========================================================================
+  // API 3: HARDENED URL FETCH (SSRF PROTECTED)
+  // =========================================================================
   app.post('/api/fetch-url', async (req, res) => {
     try {
       const { url } = req.body;
@@ -44,124 +75,117 @@ async function startServer() {
         return res.status(400).json({ error: 'Geçersiz URL parametresi' });
       }
 
-      let parsedUrl = url.trim();
-      if (!parsedUrl.startsWith('http://') && !parsedUrl.startsWith('https://')) {
-        parsedUrl = `https://${parsedUrl}`;
-      }
-
-      console.log(`Fetching reference URL: ${parsedUrl}`);
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 10000);
-
-      const response = await fetch(parsedUrl, {
-        signal: controller.signal,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
-        },
-      });
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        return res.status(response.status).json({
-          error: `URL yanıt vermedi: HTTP ${response.status}`,
-        });
-      }
-
-      const html = await response.text();
-
-      // Clean HTML to extract title and readable text
-      const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
-      const title = titleMatch ? titleMatch[1].trim() : parsedUrl;
-
-      // Extract body text, stripping scripts, styles, tags
-      let cleanText = html
-        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')
-        .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
-        .replace(/<noscript\b[^<]*(?:(?!<\/noscript>)<[^<]*)*<\/noscript>/gi, ' ')
-        .replace(/<nav\b[^<]*(?:(?!<\/nav>)<[^<]*)*<\/nav>/gi, ' ')
-        .replace(/<footer\b[^<]*(?:(?!<\/footer>)<[^<]*)*<\/footer>/gi, ' ')
-        .replace(/<header\b[^<]*(?:(?!<\/header>)<[^<]*)*<\/header>/gi, ' ')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/&nbsp;/gi, ' ')
-        .replace(/&amp;/gi, '&')
-        .replace(/&quot;/gi, '"')
-        .replace(/&#39;/gi, "'")
-        .replace(/&lt;/gi, '<')
-        .replace(/&gt;/gi, '>')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-      // Cap at 15,000 words to avoid payload bloat
-      const words = cleanText.split(/\s+/).filter(Boolean);
-      const wordCount = words.length;
-      if (wordCount > 15000) {
-        cleanText = words.slice(0, 15000).join(' ') + '... [İçerik özetlendi]';
-      }
+      console.log(`[SafeFetch] Fetching URL: ${url}`);
+      const { html, finalUrl } = await safeFetchHtml(url);
+      const extracted = extractCleanTextFromHtml(html);
 
       return res.json({
         success: true,
-        url: parsedUrl,
-        title,
-        content: cleanText,
-        wordCount: Math.min(wordCount, 15000),
+        url: finalUrl,
+        title: extracted.title,
+        metaDescription: extracted.metaDescription,
+        content: extracted.text,
+        wordCount: extracted.wordCount,
       });
     } catch (err: any) {
-      console.error('URL fetch error:', err.message);
-      return res.status(500).json({
-        error: `URL içeriği alınamadı: ${err.message || 'Bilinmeyen hata'}`,
+      console.error('[SafeFetch] Error:', err.message);
+      return res.status(400).json({
+        error: `URL içeriği alınamadı: ${err.message}`,
       });
     }
   });
 
-  // API 2: Gemini or Local Multi-Agent expansion endpoint
-  app.post('/api/ai/chat-expand', async (req, res) => {
+  // =========================================================================
+  // API 4: REAL WEB RESEARCH & COMPETITOR SCRAPING
+  // =========================================================================
+  app.post('/api/research/search-and-scrape', async (req, res) => {
     try {
-      const { prompt, references } = req.body;
-      if (!prompt) {
-        return res.status(400).json({ error: 'Komut veya metin girilmedi.' });
+      const { keyword, competitorUrls, sourcesText } = req.body;
+      if (!keyword) {
+        return res.status(400).json({ error: 'Hedef anahtar kelime gerekli.' });
       }
 
-      // If GEMINI_API_KEY is configured on server, leverage gemini-3.8-flash
-      if (genAiClient && process.env.GEMINI_API_KEY) {
-        try {
-          const sysInstruction = `Sen Bursa sanayi ve UEDAŞ bölgesinde 18 yıldır faaliyet gösteren Mir Elektrik Proje Ofisi'nin Baş Teknik Stratejist ve İçerik Mimarı Ajanısın.
-          KESİN KURALLAR:
-          1. 'Mühendis', 'Mühendislik Bürosu', '%100 garanti', 'anahtar teslim' kelimelerini KESİNLİKLE KULLANMA.
-          2. Hiçbir başlıkta (H1, H2, H3, H4) ve SSS sorusunda ASLA sayı veya numara (01, 1., Madde 1 vb.) kullanma.
-          3. Usta teknik dili koru, yapay zeka ezberinden uzak, doğrudan saha gerçeklerini aktar.`;
-
-          const response = await genAiClient.models.generateContent({
-            model: 'gemini-3.8-flash',
-            contents: `Kullanıcı Teknik Girdisi:\n${prompt}\n\nAktif Referanslar:\n${JSON.stringify(references || [])}`,
-            config: {
-              systemInstruction: sysInstruction,
-            },
-          });
-
-          return res.json({
-            success: true,
-            provider: 'gemini-3.8-flash',
-            response: response.text,
-          });
-        } catch (apiErr: any) {
-          console.warn('Gemini generate failed, fallback to structured agent:', apiErr.message);
-        }
-      }
-
-      // Fallback response with structured synthesis
-      return res.json({
-        success: true,
-        provider: 'autonomous-council-fallback',
-        response: `Teknik girdi analiz edildi (${prompt.split(/\s+/).length} kelime). Belirtilen konular 11 H2 ve 55 H3 mimarisi kapsamında sayısız başlıklarla yapılandırılmak üzere Ajan Konsülü hafızasına aktarıldı.`,
-      });
+      console.log(`[Research] Running deep competitor research for: ${keyword}`);
+      const report = await runDeepCompetitorResearch(keyword, competitorUrls || [], sourcesText || '');
+      return res.json({ success: true, report });
     } catch (err: any) {
+      console.error('[Research] Error:', err.message);
       return res.status(500).json({ error: err.message });
     }
   });
 
-  // Mount Vite or static files
+  // =========================================================================
+  // API 5: REAL MULTI-AGENT ORCHESTRATION PIPELINE
+  // =========================================================================
+  app.post('/api/ai/run-orchestrator', async (req, res) => {
+    try {
+      const { targetKeyword, provider, sources } = req.body;
+      if (!targetKeyword || typeof targetKeyword !== 'string') {
+        return res.status(400).json({ error: 'Hedef anahtar kelime girilmedi.' });
+      }
+
+      console.log(`[Orchestrator] Running real multi-agent pipeline for "${targetKeyword}" using provider: ${provider || 'auto'}`);
+      const result = await runRealAgentOrchestration({
+        targetKeyword,
+        provider,
+        sources,
+      });
+
+      return res.json({
+        success: true,
+        ...result,
+      });
+    } catch (err: any) {
+      console.error('[Orchestrator] Execution failed:', err);
+      return res.status(500).json({
+        error: `Ajan Konsülü çalıştırma hatası: ${err.message}`,
+      });
+    }
+  });
+
+  // =========================================================================
+  // API 6: 18,000-WORD CHAT ASSISTANT
+  // =========================================================================
+  app.post('/api/ai/chat-expand', async (req, res) => {
+    try {
+      const { prompt, references, provider } = req.body;
+      if (!prompt) {
+        return res.status(400).json({ error: 'Komut veya metin girilmedi.' });
+      }
+
+      const sysInstruction = `Sen Bursa sanayi ve UEDAŞ bölgesinde 18 yıldır faaliyet gösteren Mir Elektrik Proje Ofisi'nin Baş Teknik Stratejist ve İçerik Mimarı Ajanısın.
+KESİN KURALLAR:
+1. 'Mühendis', 'Mühendislik Bürosu', '%100 garanti', 'anahtar teslim' kelimelerini KESİNLİKLE KULLANMA.
+2. Hiçbir başlıkta (H1, H2, H3, H4) ve SSS sorusunda ASLA sayı veya numara (01, 1., Madde 1 vb.) kullanma.
+3. Usta teknik dili koru, yapay zeka ezberinden uzak, doğrudan saha gerçeklerini aktar.
+4. Girdideki teknik notları 1 H1, 11 H2, 55 H3 ve 35 SSS mimarisine uyumlu derin içerik parçalarına genişlet.`;
+
+      const response = await executeLlmCall({
+        provider: provider || 'gemini',
+        prompt: `Kullanıcı Teknik Girdisi:\n${prompt}\n\nAktif Referanslar:\n${JSON.stringify(references || [])}`,
+        systemInstruction: sysInstruction,
+        maxTokens: 2000,
+      });
+
+      return res.json({
+        success: true,
+        provider: response.providerUsed,
+        model: response.modelUsed,
+        tokensUsed: response.tokensUsed,
+        latencyMs: response.latencyMs,
+        response: response.text,
+        fallbackTriggered: response.fallbackTriggered,
+        notes: response.notes,
+      });
+    } catch (err: any) {
+      console.error('[Chat] Error:', err.message);
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  // =========================================================================
+  // VITE DEV SERVER OR STATIC PRODUCTION BUILD
+  // =========================================================================
   if (!isProd) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
